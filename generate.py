@@ -6,6 +6,7 @@
 import itertools
 import sys
 import time
+import pandas as pd
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -22,6 +23,7 @@ def device_sync(device):
         print(f"device={device} is not yet suppported")
 
 
+# torch._dynamo.reset()
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
@@ -66,18 +68,20 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, eos_token_id: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
-            input_pos += 1
+            input_pos = input_pos.add_(1)
             new_tokens.append(next_token.clone())
-            callback(new_tokens[-1])
+            # callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(1, -1)
+            if eos_token_id == new_tokens[-1].item():
+                break
 
     return new_tokens, new_probs
 
@@ -140,6 +144,7 @@ def generate(
     model: Transformer,
     prompt: torch.Tensor,
     max_new_tokens: int,
+    eos_token_id: int,
     *,
     interactive: bool,
     draft_model: Transformer,
@@ -162,23 +167,26 @@ def generate(
 
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
-    with torch.device(device):
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-        if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+    # with torch.device(device):
+    #     model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+    #     if is_speculative and draft_model is not model:
+    #         draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(T_new, dtype=dtype, device=device)
+    # empty = torch.empty(T_new, dtype=dtype, device=device)
+    empty = torch.tensor([eos_token_id] * T_new, dtype=dtype, device=device)
     empty[:T] = prompt
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
+    # next_token = decode_one_token(model, prompt.view(1, -1), input_pos, **sampling_kwargs)[0].clone()
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
     seq[T] = next_token
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    # input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    input_pos = torch.tensor([T], device=device)
     accept_counts = [0] * (speculate_k + 1)
 
     if is_speculative:
@@ -198,12 +206,16 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, eos_token_id=eos_token_id, callback=callback, **sampling_kwargs)
+        seq[T + 1: T + 1 + len(generated_tokens)] = torch.cat(generated_tokens)
 
     generate_stats = {
         'accept_counts': accept_counts
     }
+    # torch.cuda.empty_cache()
+    # gc.collect()
+    # for b in model.layers:
+    #     b.attention.kv_cache.reset_parameters()
     return seq, generate_stats
 
 def encode_tokens(tokenizer, string, bos=True, device='cuda'):
@@ -212,17 +224,20 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(checkpoint_path, device, precision, use_tp, model_name=None, quantization=None):
     with torch.device('meta'):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        if model_name is None:
+            model_name = checkpoint_path.parent.name
+        print(f"{model_name=}")
+        model = Transformer.from_name(model_name)
 
-    if "int8" in str(checkpoint_path):
+    if quantization == "int8":
         print("Using int8 weight-only quantization!")
         from quantize import WeightOnlyInt8QuantHandler
         simple_quantizer = WeightOnlyInt8QuantHandler(model)
         model = simple_quantizer.convert_for_runtime()
 
-    if "int4" in str(checkpoint_path):
+    elif quantization == "int4":
         print("Using int4 quantization!")
         path_comps = checkpoint_path.name.split(".")
         assert path_comps[-2].startswith("g")
@@ -246,14 +261,18 @@ B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
     prompt: str = "Hello, my name is",
+    inputfile: str = None,
+    outputfile: str = None,
     interactive: bool = False,
     num_samples: int = 5,
     max_new_tokens: int = 100,
     top_k: int = 200,
     temperature: float = 0.8,
     checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+    model_name=None,
     compile: bool = True,
     compile_prefill: bool = False,
+    quantization: str = None,
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
@@ -272,7 +291,7 @@ def main(
     use_tp = rank is not None
     if use_tp:
         if rank != 0:
-            # only print on rank 0
+            # only `print` on rank 0
             print = lambda *args, **kwargs: None
 
     print(f"Using device={device}")
@@ -282,19 +301,20 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
+    model = _load_model(checkpoint_path, device, precision, use_tp, model_name=model_name, quantization=quantization)
 
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp, model_name=model_name, quantization=quantization)
     else:
         draft_model = None
 
     device_sync(device=device) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
-    encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    prompt_length = encoded.size(0)
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_length=1024)
+        if is_speculative and draft_model is not model:
+            draft_model.setup_caches(max_batch_size=1, max_seq_length=1024)
 
     torch.manual_seed(1234)
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
@@ -308,9 +328,10 @@ def main(
 
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
+        # decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")
 
         # Uncomment to squeeze more perf out of prefill
-        if args.compile_prefill:
+        if compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
 
 
@@ -320,13 +341,33 @@ def main(
     }
     start = -1 if compile else 0
 
+    prompt_template, _ = prompt_config()
+
+    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+
+    if inputfile is not None:
+        list_prompts = pd.read_csv(inputfile)["input"].tolist()
+        num_samples = len(list_prompts)
+        outputs = []
+    else:
+        # prompt = "a photo of a firefighter talking to a Caucasian nurse and Latino male person"
+        pass        
+
     for i in range(start, num_samples):
+        if inputfile is not None:
+            prompt = list_prompts[i]
+        full_prompt = prompt_template.format(prompt=prompt)
+        print(f"{prompt=}")
+        encoded = encode_tokens(tokenizer, full_prompt, bos=True, device=device)
+        prompt_length = encoded.size(0)
+
         device_sync(device=device) # MKG
         if i >= 0 and interactive:
-            prompt = input("What is your prompt? ")
+            full_prompt = input("What is your prompt? ")
             if is_chat:
-                prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+                full_prompt = f"{B_INST} {full_prompt.strip()} {E_INST}"
+            encoded = encode_tokens(tokenizer, full_prompt, bos=True, device=device)
+            prompt_length = encoded.size(0)
 
         if interactive and i >= 0:
             buffer = []
@@ -345,6 +386,7 @@ def main(
                 # print(, end='', flush=True)
         else:
             callback = lambda x : x
+
         t0 = time.perf_counter()
         import contextlib
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
@@ -357,6 +399,7 @@ def main(
                 model,
                 encoded,
                 max_new_tokens,
+                tokenizer.eos_id(),
                 draft_model=draft_model,
                 speculate_k=speculate_k,
                 interactive=interactive,
@@ -377,10 +420,17 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            if inputfile is not None:
+                if i >= 0:
+                    outputs.append(tokenizer.decode(y.tolist())[len(full_prompt):])
+                    print(tokenizer.decode(y.tolist()))
+            else:
+                print(tokenizer.decode(y.tolist()))
         else:
             print()
-        tokens_generated = y.size(0) - prompt_length
+        tokens_generated = (y.tolist().index(tokenizer.eos_id()) + 1) - prompt_length
+        # tokens_generated = y.size(0) - prompt_length
+        print(f"{tokens_generated=}")
         tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
@@ -395,28 +445,52 @@ def main(
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
+    if inputfile is not None:
+        pd.DataFrame(outputs).to_csv(outputfile, index=False, header=False)
+
+
+def prompt_config():
+    b_inst, e_inst = "[INST]", "[/INST]"
+    instruction = \
+"""Extract a list of human descriptions from the text. One line for each person with the desired format: ethnicity,gender|identity.
+Return an empty string if the text does not involve any person."""
+    prompt_template = (
+        f"{b_inst}\n"
+        f"{instruction}\n"
+        "\n"
+        f"Text: {{prompt}}\n"
+        f"{e_inst}\n"
+    )
+    response_template = f"\n{e_inst}"
+    return prompt_template, response_template
+
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    parser.add_argument('--inputfile', type=str, default=None, help='Input CSV file.')
+    parser.add_argument('--outputfile', type=str, default=None, help='Output CSV file.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--model_name', type=str, default=None, help='Model name, e.g, Mistral7B. See transformer_configs in model.py.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
+    parser.add_argument('--quantization', type=str, default=None, help='qunatization int8/int4.')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
-    parser.add_argument('--device', type=str, default="cuda", help='device to use')
+    parser.add_argument('--device', type=str, default="cuda", help='Device to use.')
 
     args = parser.parse_args()
     main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
+        args.prompt, args.inputfile, args.outputfile, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
+        args.temperature, args.checkpoint_path, args.model_name, args.compile, args.compile_prefill,
+        args.quantization, args.profile, args.draft_checkpoint_path,
         args.speculate_k, args.device
     )

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from safetensors.torch import load_file
 import torch
 
 # support running without installing as a package
@@ -32,6 +33,8 @@ def convert_hf_checkpoint(
 
     # Load the json file containing weight mapping
     model_map_json = checkpoint_dir / "pytorch_model.bin.index.json"
+    if not model_map_json.is_file():
+        model_map_json = checkpoint_dir / "model.safetensors.index.json"
 
     assert model_map_json.is_file()
 
@@ -65,7 +68,10 @@ def convert_hf_checkpoint(
 
     merged_result = {}
     for file in sorted(bin_files):
-        state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
+        if str(file).endswith("safetensors"):
+            state_dict = load_file(str(file), device="cpu")
+        else:
+            state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
         merged_result.update(state_dict)
     final_result = {}
     for key, value in merged_result.items():

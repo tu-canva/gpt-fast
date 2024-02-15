@@ -59,25 +59,33 @@ transformer_configs = {
     "30B": dict(n_layer=60, n_head=52, dim=6656),
     "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
     "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
+    "Mistral7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
 }
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype), persistent=False)
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype), persistent=False)
 
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
 
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
+        # k_out = self.k_cache
+        # v_out = self.v_cache
+        # k_out[:, :, input_pos] = k_val
+        # v_out[:, :, input_pos] = v_val
+
+        k_out = self.k_cache.index_copy_(2, input_pos, k_val)
+        v_out = self.v_cache.index_copy_(2, input_pos, v_val)
 
         return k_out, v_out
+    
+    def reset_parameters(self) -> None:
+        torch.nn.init.zeros_(self.k_cache)
+        torch.nn.init.zeros_(self.v_cache)
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
